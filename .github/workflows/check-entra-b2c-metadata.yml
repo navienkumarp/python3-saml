@@ -19,16 +19,23 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq xmlsec1 openssl
 
-      - name: Fetch documented public metadata examples
+      - name: Fetch public and preserved metadata examples
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p artifact/responses
           cat > artifact/candidates.tsv <<'EOF'
           stellar	https://stellarpmb2c.b2clogin.com/stellarpmb2c.onmicrosoft.com/B2C_1A_signup_signin_saml/samlp/metadata
+          stellar_te	https://stellarpmb2c.b2clogin.com/te/stellarpmb2c.onmicrosoft.com/B2C_1A_signup_signin_saml/Samlp/metadata
           bluedolphin_eu	https://bluedolphin03.b2clogin.com/bluedolphin03.onmicrosoft.com/B2C_1A_bd_base/samlp/metadata
-          bluedolphin_us	https://bluedolphinprdus.b2clogin.com/bluedolphinprdus.onmicrosoft.com/B2C_1A_bd_base/samlp/metadata
-          miniorange	https://miniorange.b2clogin.com/miniorange.onmicrosoft.com/B2C_1A_signup_signin_saml/samlp/metadata
+          bluedolphin_eu_te	https://bluedolphin03.b2clogin.com/te/bluedolphin03.onmicrosoft.com/B2C_1A_bd_base/Samlp/metadata
+          nfpoc	https://nfpoc.b2clogin.com/nfpoc.onmicrosoft.com/B2C_1A_SI_SAML_SAMPLE/Samlp/metadata
+          nfpoc_te	https://nfpoc.b2clogin.com/te/nfpoc.onmicrosoft.com/B2C_1A_SI_SAML_SAMPLE/Samlp/metadata
+          safemarch	https://safemarch.b2clogin.com/safemarch.onmicrosoft.com/B2C_1A_signup_signin_saml/Samlp/metadata
+          safemarch_te	https://safemarch.b2clogin.com/te/safemarch.onmicrosoft.com/B2C_1A_signup_signin_saml/Samlp/metadata
+          mydaad_live	https://mydaad.b2clogin.com/mydaad.onmicrosoft.com/B2C_1A_signup_signin_myGuide_saml/samlp/metadata
+          mydaad_te	https://mydaad.b2clogin.com/te/mydaad.onmicrosoft.com/B2C_1A_signup_signin_myGuide_saml/Samlp/metadata
+          archived_mydaad	https://raw.githubusercontent.com/University-of-Potsdam-MM/BIRD-Liferay/da4e4306938d211f06ab6f30d4396767da46e038/modules/liferay-shibboleth-plugin/doc/daad-metadata.xml
           EOF
           while IFS=$'\t' read -r label url; do
             code=$(curl -sS -L --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 60 \
@@ -61,6 +68,7 @@ jobs:
                   sigs=root.findall(f'{{{DS}}}Signature')
                   idps=root.findall(f'{{{MD}}}IDPSSODescriptor')
                   roles=root.findall(f'{{{MD}}}RoleDescriptor')
+                  sps=root.findall(f'{{{MD}}}SPSSODescriptor')
                   row.update({
                     'root':root.tag,
                     'root_id':root.attrib.get('ID'),
@@ -68,6 +76,7 @@ jobs:
                     'direct_signature_count':len(sigs),
                     'role_descriptor_count':len(roles),
                     'idp_sso_descriptor_count':len(idps),
+                    'sp_sso_descriptor_count':len(sps),
                     'xsi_types':[el.attrib[f'{{{XSI}}}type'] for el in root.iter() if f'{{{XSI}}}type' in el.attrib],
                   })
                   if sigs:
@@ -77,9 +86,6 @@ jobs:
                       cert=sig.find(f'.//{{{DS}}}X509Certificate')
                       if cert is not None and cert.text:
                           der=base64.b64decode(''.join(cert.text.split()))
-                          pathlib.Path(f'artifact/responses/{label}.cer').write_bytes(der)
-                          pem='-----BEGIN CERTIFICATE-----\n'+base64.encodebytes(der).decode().replace('\n','').strip()+'\n-----END CERTIFICATE-----\n'
-                          # Re-wrap PEM correctly.
                           b64=base64.b64encode(der).decode()
                           pem='-----BEGIN CERTIFICATE-----\n'+'\n'.join(b64[i:i+64] for i in range(0,len(b64),64))+'\n-----END CERTIFICATE-----\n'
                           pathlib.Path(f'artifact/responses/{label}.pem').write_text(pem)
