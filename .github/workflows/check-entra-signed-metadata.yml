@@ -1,0 +1,119 @@
+name: Check Entra signed metadata
+
+on:
+  push:
+    branches:
+      - entra-metadata-check-20260914
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install XML signature tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xmlsec1 libxml2-utils openssl
+
+      - name: Fetch and inspect Entra application metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifact
+          cat > artifact/urls.tsv <<'EOF'
+          app1	https://login.microsoftonline.com/2a3fb44f-df5e-4b79-8355-98c683931d5d/federationmetadata/2007-06/federationmetadata.xml?appid=29d0542c-905a-48cc-8e74-08581482b38a
+          app2	https://login.microsoftonline.com/2a3fb44f-df5e-4b79-8355-98c683931d5d/federationmetadata/2007-06/federationmetadata.xml?appid=8945d7f4-8835-437b-81be-941d9be835c2
+          EOF
+
+          while IFS=$'\t' read -r label url; do
+            echo "Fetching $label" | tee -a artifact/fetch.log
+            if curl -fSL --retry 4 --retry-delay 2 --connect-timeout 20 --max-time 60 \
+                -D "artifact/${label}.headers" "$url" -o "artifact/${label}.xml"; then
+              sha256sum "artifact/${label}.xml" | tee "artifact/${label}.sha256"
+            else
+              echo "FETCH_FAILED" | tee "artifact/${label}.error"
+            fi
+          done < artifact/urls.tsv
+
+          cat > /tmp/inspect.py <<'PY'
+          import base64
+          import json
+          import pathlib
+          import xml.etree.ElementTree as ET
+
+          DS = "http://www.w3.org/2000/09/xmldsig#"
+          out = {}
+          for path in sorted(pathlib.Path("artifact").glob("app*.xml")):
+              label = path.stem
+              row = {"bytes": path.stat().st_size}
+              try:
+                  root = ET.parse(path).getroot()
+                  sigs = root.findall(f"{{{DS}}}Signature")
+                  row.update({
+                      "root_tag": root.tag,
+                      "root_id": root.attrib.get("ID"),
+                      "entity_id": root.attrib.get("entityID"),
+                      "direct_signature_count": len(sigs),
+                  })
+                  if sigs:
+                      sig = sigs[0]
+                      si = sig.find(f"{{{DS}}}SignedInfo")
+                      ref = si.find(f"{{{DS}}}Reference") if si is not None else None
+                      transforms = []
+                      if ref is not None:
+                          t_parent = ref.find(f"{{{DS}}}Transforms")
+                          if t_parent is not None:
+                              transforms = [x.attrib.get("Algorithm") for x in t_parent.findall(f"{{{DS}}}Transform")]
+                      row.update({
+                          "reference_uri": ref.attrib.get("URI") if ref is not None else None,
+                          "canonicalization": (si.find(f"{{{DS}}}CanonicalizationMethod").attrib.get("Algorithm") if si is not None and si.find(f"{{{DS}}}CanonicalizationMethod") is not None else None),
+                          "signature_method": (si.find(f"{{{DS}}}SignatureMethod").attrib.get("Algorithm") if si is not None and si.find(f"{{{DS}}}SignatureMethod") is not None else None),
+                          "digest_method": (ref.find(f"{{{DS}}}DigestMethod").attrib.get("Algorithm") if ref is not None and ref.find(f"{{{DS}}}DigestMethod") is not None else None),
+                          "transforms": transforms,
+                          "signature_value_present": sig.find(f"{{{DS}}}SignatureValue") is not None,
+                      })
+                      cert = sig.find(f".//{{{DS}}}X509Certificate")
+                      if cert is not None and cert.text:
+                          der = base64.b64decode("".join(cert.text.split()))
+                          pathlib.Path(f"artifact/{label}.cer").write_bytes(der)
+                          row["embedded_certificate_bytes"] = len(der)
+                  out[label] = row
+              except Exception as exc:
+                  out[label] = {"parse_error": type(exc).__name__ + ": " + str(exc), **row}
+
+          pathlib.Path("artifact/inspection.json").write_text(json.dumps(out, indent=2) + "\n")
+          print(json.dumps(out, indent=2))
+          PY
+          python3 /tmp/inspect.py | tee artifact/inspection.stdout
+
+          for xml in artifact/app*.xml; do
+            [ -e "$xml" ] || continue
+            label="$(basename "$xml" .xml)"
+            if [ -s "artifact/${label}.cer" ]; then
+              openssl x509 -inform DER -in "artifact/${label}.cer" -out "artifact/${label}.pem"
+              openssl x509 -in "artifact/${label}.pem" -noout -subject -issuer -serial -fingerprint -sha256 \
+                > "artifact/${label}.certificate.txt"
+              set +e
+              xmlsec1 --verify \
+                --id-attr:ID EntityDescriptor \
+                --pubkey-cert-pem "artifact/${label}.pem" \
+                "$xml" > "artifact/${label}.xmlsec.stdout" 2> "artifact/${label}.xmlsec.stderr"
+              status=$?
+              set -e
+              echo "$status" > "artifact/${label}.xmlsec.exit"
+            fi
+          done
+
+          find artifact -maxdepth 1 -type f -printf '%f\n' | sort | tee artifact/files.txt
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: entra-signed-metadata-check
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 1
