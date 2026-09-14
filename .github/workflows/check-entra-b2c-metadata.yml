@@ -1,0 +1,111 @@
+name: Check Entra B2C SAML metadata
+
+on:
+  push:
+    branches:
+      - entra-b2c-metadata-check-20260914
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install XML tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xmlsec1 openssl
+
+      - name: Fetch documented public metadata examples
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifact/responses
+          cat > artifact/candidates.tsv <<'EOF'
+          stellar	https://stellarpmb2c.b2clogin.com/stellarpmb2c.onmicrosoft.com/B2C_1A_signup_signin_saml/samlp/metadata
+          bluedolphin_eu	https://bluedolphin03.b2clogin.com/bluedolphin03.onmicrosoft.com/B2C_1A_bd_base/samlp/metadata
+          bluedolphin_us	https://bluedolphinprdus.b2clogin.com/bluedolphinprdus.onmicrosoft.com/B2C_1A_bd_base/samlp/metadata
+          miniorange	https://miniorange.b2clogin.com/miniorange.onmicrosoft.com/B2C_1A_signup_signin_saml/samlp/metadata
+          EOF
+          while IFS=$'\t' read -r label url; do
+            code=$(curl -sS -L --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 60 \
+              -D "artifact/responses/${label}.headers" \
+              -o "artifact/responses/${label}.xml" \
+              -w '%{http_code}' "$url" || true)
+            printf '%s\t%s\t%s\n' "$label" "$code" "$url" >> artifact/http-results.tsv
+            sleep 1
+          done < artifact/candidates.tsv
+
+      - name: Inspect and verify signatures
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, json, pathlib, subprocess
+          import xml.etree.ElementTree as ET
+
+          MD='urn:oasis:names:tc:SAML:2.0:metadata'
+          DS='http://www.w3.org/2000/09/xmldsig#'
+          XSI='http://www.w3.org/2001/XMLSchema-instance'
+          rows=[]
+          for line in pathlib.Path('artifact/http-results.tsv').read_text().splitlines():
+              label, code, url = line.split('\t', 2)
+              path=pathlib.Path(f'artifact/responses/{label}.xml')
+              body=path.read_bytes()
+              row={'label':label,'http':int(code or 0),'url':url,'bytes':len(body),'sha256':hashlib.sha256(body).hexdigest()}
+              try:
+                  root=ET.fromstring(body)
+                  sigs=root.findall(f'{{{DS}}}Signature')
+                  idps=root.findall(f'{{{MD}}}IDPSSODescriptor')
+                  roles=root.findall(f'{{{MD}}}RoleDescriptor')
+                  row.update({
+                    'root':root.tag,
+                    'root_id':root.attrib.get('ID'),
+                    'entity_id':root.attrib.get('entityID'),
+                    'direct_signature_count':len(sigs),
+                    'role_descriptor_count':len(roles),
+                    'idp_sso_descriptor_count':len(idps),
+                    'xsi_types':[el.attrib[f'{{{XSI}}}type'] for el in root.iter() if f'{{{XSI}}}type' in el.attrib],
+                  })
+                  if sigs:
+                      sig=sigs[0]
+                      ref=sig.find(f'{{{DS}}}SignedInfo/{{{DS}}}Reference')
+                      row['reference_uri']=ref.attrib.get('URI') if ref is not None else None
+                      cert=sig.find(f'.//{{{DS}}}X509Certificate')
+                      if cert is not None and cert.text:
+                          der=base64.b64decode(''.join(cert.text.split()))
+                          pathlib.Path(f'artifact/responses/{label}.cer').write_bytes(der)
+                          pem='-----BEGIN CERTIFICATE-----\n'+base64.encodebytes(der).decode().replace('\n','').strip()+'\n-----END CERTIFICATE-----\n'
+                          # Re-wrap PEM correctly.
+                          b64=base64.b64encode(der).decode()
+                          pem='-----BEGIN CERTIFICATE-----\n'+'\n'.join(b64[i:i+64] for i in range(0,len(b64),64))+'\n-----END CERTIFICATE-----\n'
+                          pathlib.Path(f'artifact/responses/{label}.pem').write_text(pem)
+                          idp_certs=[]
+                          for idp in idps:
+                              for c in idp.findall(f'.//{{{DS}}}X509Certificate'):
+                                  if c.text:
+                                      idp_certs.append(''.join(c.text.split()))
+                          row['signature_cert_matches_idp_signing_cert']=b64 in idp_certs
+                          cmd=['xmlsec1','--verify','--id-attr:ID','EntityDescriptor','--pubkey-cert-pem',f'artifact/responses/{label}.pem',str(path)]
+                          proc=subprocess.run(cmd,text=True,capture_output=True)
+                          pathlib.Path(f'artifact/responses/{label}.xmlsec.stdout').write_text(proc.stdout)
+                          pathlib.Path(f'artifact/responses/{label}.xmlsec.stderr').write_text(proc.stderr)
+                          row['xmlsec_exit']=proc.returncode
+              except Exception as exc:
+                  row['parse_error']=type(exc).__name__+': '+str(exc)
+                  row['prefix']=body[:200].decode('utf-8','replace')
+              rows.append(row)
+          pathlib.Path('artifact/analysis.json').write_text(json.dumps(rows,indent=2)+'\n')
+          print(json.dumps(rows,indent=2))
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: entra-b2c-metadata-check
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 1
