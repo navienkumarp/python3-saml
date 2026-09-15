@@ -1,0 +1,139 @@
+name: Check Entra clean metadata candidates
+
+on:
+  push:
+    branches:
+      - entra-endpoint-variants-20260914
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install XML tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xmlsec1 openssl
+
+      - name: Fetch a low-volume endpoint matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifact/responses
+          tenant='b411bcba-01b1-4de5-9fa1-45272da91a0c'
+          app='db0e60a2-0f7b-4a61-939a-56fbae2d8b8c'
+          cat > artifact/candidates.tsv <<EOF
+          baseline_app	https://login.microsoftonline.com/${tenant}/federationmetadata/2007-06/federationmetadata.xml?appid=${app}
+          nexus_global	https://nexus.microsoftonline-p.com/federationmetadata/saml20/federationmetadata.xml
+          nexus_app	https://nexus.microsoftonline-p.com/federationmetadata/saml20/federationmetadata.xml?appid=${app}
+          nexus_tenant	https://nexus.microsoftonline-p.com/federationmetadata/saml20/federationmetadata.xml?tenantid=${tenant}
+          nexus_tenant_app	https://nexus.microsoftonline-p.com/federationmetadata/saml20/federationmetadata.xml?tenantid=${tenant}&appid=${app}
+          nexus_2007_app	https://nexus.microsoftonline-p.com/federationmetadata/2007-06/federationmetadata.xml?appid=${app}
+          login_tenant_saml20_app	https://login.microsoftonline.com/${tenant}/federationmetadata/saml20/federationmetadata.xml?appid=${app}
+          login_common_saml20_app	https://login.microsoftonline.com/common/federationmetadata/saml20/federationmetadata.xml?appid=${app}
+          windows_tenant_saml20_app	https://login.windows.net/${tenant}/federationmetadata/saml20/federationmetadata.xml?appid=${app}
+          nexus_path_tenant_app	https://nexus.microsoftonline-p.com/${tenant}/federationmetadata/saml20/federationmetadata.xml?appid=${app}
+          EOF
+          while IFS=$'\t' read -r label url; do
+            code=$(curl -sS -L --retry 2 --retry-delay 1 --connect-timeout 15 --max-time 60 \
+              -D "artifact/responses/${label}.headers" \
+              -o "artifact/responses/${label}.body" \
+              -w '%{http_code}' "$url" || true)
+            printf '%s\t%s\t%s\n' "$label" "$code" "$url" >> artifact/http-results.tsv
+            sleep 1
+          done < artifact/candidates.tsv
+
+      - name: Inspect signatures and certificate equality
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, json, pathlib, subprocess
+          import xml.etree.ElementTree as ET
+
+          MD='urn:oasis:names:tc:SAML:2.0:metadata'
+          DS='http://www.w3.org/2000/09/xmldsig#'
+          XSI='http://www.w3.org/2001/XMLSchema-instance'
+
+          rows=[]
+          certs={}
+          parsed={}
+          for line in pathlib.Path('artifact/http-results.tsv').read_text().splitlines():
+              label, code, url = line.split('\t', 2)
+              path=pathlib.Path(f'artifact/responses/{label}.body')
+              body=path.read_bytes()
+              row={
+                  'label':label,
+                  'http':int(code or 0),
+                  'url':url,
+                  'bytes':len(body),
+                  'sha256':hashlib.sha256(body).hexdigest(),
+              }
+              try:
+                  root=ET.fromstring(body)
+                  parsed[label]=(root,path)
+                  sigs=root.findall(f'{{{DS}}}Signature')
+                  idps=root.findall(f'{{{MD}}}IDPSSODescriptor')
+                  roles=root.findall(f'{{{MD}}}RoleDescriptor')
+                  row.update({
+                      'root':root.tag,
+                      'root_id':root.attrib.get('ID'),
+                      'entity_id':root.attrib.get('entityID'),
+                      'direct_signature_count':len(sigs),
+                      'role_descriptor_count':len(roles),
+                      'idp_sso_descriptor_count':len(idps),
+                      'xsi_types':[e.attrib[f'{{{XSI}}}type'] for e in root.iter() if f'{{{XSI}}}type' in e.attrib],
+                  })
+                  if sigs:
+                      sig=sigs[0]
+                      ref=sig.find(f'{{{DS}}}SignedInfo/{{{DS}}}Reference')
+                      row['reference_uri']=ref.attrib.get('URI') if ref is not None else None
+                      cert=sig.find(f'.//{{{DS}}}X509Certificate')
+                      if cert is not None and cert.text:
+                          der=base64.b64decode(''.join(cert.text.split()))
+                          certs[label]=der
+                          row['signature_cert_sha256']=hashlib.sha256(der).hexdigest()
+                          b64=base64.b64encode(der).decode()
+                          pem='-----BEGIN CERTIFICATE-----\n'+'\n'.join(b64[i:i+64] for i in range(0,len(b64),64))+'\n-----END CERTIFICATE-----\n'
+                          pem_path=pathlib.Path(f'artifact/responses/{label}.pem')
+                          pem_path.write_text(pem)
+                          idp_certs=[''.join(c.text.split()) for idp in idps for c in idp.findall(f'.//{{{DS}}}X509Certificate') if c.text]
+                          row['signature_cert_matches_own_idp_signing_cert']=b64 in idp_certs
+                          proc=subprocess.run([
+                              'xmlsec1','--verify','--id-attr:ID','EntityDescriptor',
+                              '--pubkey-cert-pem',str(pem_path),str(path)
+                          ],capture_output=True,text=True)
+                          row['xmlsec_exit']=proc.returncode
+                          pathlib.Path(f'artifact/responses/{label}.xmlsec.stderr').write_text(proc.stderr)
+              except Exception as exc:
+                  row['parse_error']=type(exc).__name__+': '+str(exc)
+                  row['prefix']=body[:180].decode('utf-8','replace')
+              rows.append(row)
+
+          baseline=certs.get('baseline_app')
+          for row in rows:
+              cert=certs.get(row['label'])
+              row['signature_cert_matches_baseline_app']=bool(baseline is not None and cert is not None and cert == baseline)
+              row['strict_shape_candidate']=bool(
+                  row.get('http') == 200
+                  and row.get('direct_signature_count') == 1
+                  and row.get('xmlsec_exit') == 0
+                  and row.get('role_descriptor_count') == 0
+                  and not row.get('xsi_types')
+              )
+
+          pathlib.Path('artifact/analysis.json').write_text(json.dumps(rows,indent=2)+'\n')
+          print(json.dumps(rows,indent=2))
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: entra-clean-metadata-candidates
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 1
