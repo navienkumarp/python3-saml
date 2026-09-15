@@ -1,0 +1,87 @@
+name: Entra metadata content negotiation
+
+on:
+  push:
+    branches:
+      - entra-header-negotiation-20260915
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch a small header matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifact/responses
+          url='https://login.microsoftonline.com/b411bcba-01b1-4de5-9fa1-45272da91a0c/federationmetadata/2007-06/federationmetadata.xml?appid=db0e60a2-0f7b-4a61-939a-56fbae2d8b8c'
+
+          fetch() {
+            label="$1"; shift
+            code=$(curl -sS -L --retry 2 --retry-delay 1 --connect-timeout 15 --max-time 60 \
+              "$@" -D "artifact/responses/${label}.headers" \
+              -o "artifact/responses/${label}.body" -w '%{http_code}' "$url" || true)
+            printf '%s\t%s\n' "$label" "$code" >> artifact/http-results.tsv
+            sleep 1
+          }
+
+          fetch default
+          fetch samlmetadata -H 'Accept: application/samlmetadata+xml'
+          fetch application_xml -H 'Accept: application/xml'
+          fetch text_xml -H 'Accept: text/xml'
+          fetch wsfed -H 'Accept: application/wsfed+xml'
+          fetch saml_profile -H 'Accept: application/xml; profile="urn:oasis:names:tc:SAML:2.0:metadata"'
+          fetch portal_ua -A 'Mozilla/5.0 Microsoft Entra admin center metadata downloader'
+
+      - name: Analyze response shapes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, json, pathlib
+          import xml.etree.ElementTree as ET
+
+          MD='urn:oasis:names:tc:SAML:2.0:metadata'
+          DS='http://www.w3.org/2000/09/xmldsig#'
+          XSI='http://www.w3.org/2001/XMLSchema-instance'
+          rows=[]
+          for line in pathlib.Path('artifact/http-results.tsv').read_text().splitlines():
+              label, code = line.split('\t', 1)
+              body=pathlib.Path(f'artifact/responses/{label}.body').read_bytes()
+              row={'label':label,'http':int(code or 0),'bytes':len(body),'sha256':hashlib.sha256(body).hexdigest()}
+              try:
+                  root=ET.fromstring(body)
+                  sig=root.find(f'{{{DS}}}Signature')
+                  roles=root.findall(f'{{{MD}}}RoleDescriptor')
+                  idps=root.findall(f'{{{MD}}}IDPSSODescriptor')
+                  row.update({
+                    'root':root.tag,
+                    'entity_id':root.attrib.get('entityID'),
+                    'direct_signature_count':1 if sig is not None else 0,
+                    'role_descriptor_count':len(roles),
+                    'idp_sso_descriptor_count':len(idps),
+                    'xsi_types':[e.attrib[f'{{{XSI}}}type'] for e in root.iter() if f'{{{XSI}}}type' in e.attrib],
+                  })
+                  if sig is not None:
+                      cert=sig.find(f'.//{{{DS}}}X509Certificate')
+                      if cert is not None and cert.text:
+                          der=base64.b64decode(''.join(cert.text.split()))
+                          row['signature_cert_sha256']=hashlib.sha256(der).hexdigest()
+              except Exception as exc:
+                  row['parse_error']=type(exc).__name__+': '+str(exc)
+                  row['prefix']=body[:160].decode('utf-8','replace')
+              rows.append(row)
+          pathlib.Path('artifact/analysis.json').write_text(json.dumps(rows,indent=2)+'\n')
+          print(json.dumps(rows,indent=2))
+          PY
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: entra-metadata-content-negotiation
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 1
