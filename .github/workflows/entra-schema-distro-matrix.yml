@@ -1,0 +1,100 @@
+name: Entra schema distro matrix
+
+on:
+  push:
+    branches:
+      - entra-libxml-distro-matrix-20260915
+
+permissions:
+  contents: read
+
+jobs:
+  schema:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: ubuntu2004
+            image: ubuntu:20.04
+          - label: ubuntu2204
+            image: ubuntu:22.04
+          - label: ubuntu2404
+            image: ubuntu:24.04
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.image }}
+      env:
+        DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Install distro PHP DOM and tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update -qq
+          apt-get install -y -qq php-cli php-xml curl ca-certificates tar
+          php -m | grep -qx dom
+
+      - name: Fetch exact schemas and public metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /work/evidence
+          curl -fL --retry 3 --retry-delay 2 \
+            https://github.com/SAML-Toolkits/php-saml/archive/refs/tags/4.3.2.tar.gz \
+            -o /work/php-saml.tar.gz
+          tar -xzf /work/php-saml.tar.gz -C /work
+          curl -fL --retry 3 --retry-delay 2 \
+            'https://login.microsoftonline.com/b411bcba-01b1-4de5-9fa1-45272da91a0c/federationmetadata/2007-06/federationmetadata.xml?appid=db0e60a2-0f7b-4a61-939a-56fbae2d8b8c' \
+            -o /work/entra.xml
+
+      - name: Run schema gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /work/check.php <<'PHP'
+          <?php
+          $raw = file_get_contents('/work/entra.xml');
+          $raw = preg_replace('/^\xEF\xBB\xBF/', '', $raw);
+          $raw = preg_replace('/^\s*<\?xml[^?]*\?>\s*/', '', $raw, 1);
+          $now = gmdate('Y-m-d\\TH:i:s\\Z');
+          $xml = '<?xml version="1.0" encoding="UTF-8"?>'
+            . '<p:Response xmlns:p="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:a="urn:oasis:names:tc:SAML:2.0:assertion" ID="_r" Version="2.0" IssueInstant="'.$now.'">'
+            . '<a:Issuer>https://sts.windows.net/b411bcba-01b1-4de5-9fa1-45272da91a0c/</a:Issuer>'
+            . '<p:Status><p:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/><p:StatusDetail>'
+            . $raw
+            . '</p:StatusDetail></p:Status>'
+            . '<a:Assertion ID="_a" Version="2.0" IssueInstant="'.$now.'"><a:Issuer>https://sts.windows.net/b411bcba-01b1-4de5-9fa1-45272da91a0c/</a:Issuer>'
+            . '<a:Subject><a:NameID>test@example.invalid</a:NameID></a:Subject><a:Conditions/>'
+            . '<a:AuthnStatement AuthnInstant="'.$now.'"><a:AuthnContext><a:AuthnContextClassRef>urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport</a:AuthnContextClassRef></a:AuthnContext></a:AuthnStatement>'
+            . '</a:Assertion></p:Response>';
+          $doc = new DOMDocument();
+          $doc->preserveWhiteSpace = true;
+          if (!$doc->loadXML($xml, LIBXML_NONET)) { throw new RuntimeException('parse failed'); }
+          libxml_use_internal_errors(true);
+          libxml_clear_errors();
+          $ok = @$doc->schemaValidate('/work/php-saml-4.3.2/src/Saml2/schemas/saml-schema-protocol-2.0.xsd');
+          $errors = array();
+          foreach (libxml_get_errors() as $e) {
+              $errors[] = array('code'=>$e->code,'level'=>$e->level,'message'=>trim($e->message));
+          }
+          $out = array(
+              'php'=>PHP_VERSION,
+              'libxml'=>defined('LIBXML_DOTTED_VERSION') ? LIBXML_DOTTED_VERSION : null,
+              'schema_valid'=>$ok,
+              'errors'=>$errors,
+          );
+          file_put_contents('/work/evidence/result.json', json_encode($out, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)."\n");
+          echo json_encode($out, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), "\n";
+          PHP
+          php /work/check.php
+          php -v > /work/evidence/php-version.txt
+          php -i | grep -E '^(libXML|DOM/XML|PHP Version)' > /work/evidence/runtime.txt || true
+          sha256sum /work/evidence/* > /work/evidence/SHA256SUMS
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: entra-schema-${{ matrix.label }}
+          path: /work/evidence/
+          if-no-files-found: error
+          retention-days: 1
