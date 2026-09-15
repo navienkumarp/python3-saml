@@ -1,0 +1,125 @@
+name: Entra schema libxml matrix
+
+on:
+  push:
+    branches:
+      - entra-libxml-matrix-20260915
+
+permissions:
+  contents: read
+
+jobs:
+  schema:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: php74-bullseye
+            image: php:7.4-cli-bullseye
+          - label: php80-bullseye
+            image: php:8.0-cli-bullseye
+          - label: php81-bullseye
+            image: php:8.1-cli-bullseye
+          - label: php82-bookworm
+            image: php:8.2-cli-bookworm
+          - label: php83-bookworm
+            image: php:8.3-cli-bookworm
+          - label: php84-bookworm
+            image: php:8.4-cli-bookworm
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - name: Install DOM and tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update -qq
+          apt-get install -y -qq libxml2-dev curl ca-certificates tar
+          docker-php-ext-install -j2 dom >/tmp/dom-build.log 2>&1
+          php -m | grep -qx dom
+
+      - name: Fetch exact toolkit schemas and public Entra metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /work/evidence
+          curl -fL --retry 3 --retry-delay 2 \
+            https://github.com/SAML-Toolkits/php-saml/archive/refs/tags/4.3.2.tar.gz \
+            -o /work/php-saml.tar.gz
+          tar -xzf /work/php-saml.tar.gz -C /work
+          curl -fL --retry 3 --retry-delay 2 \
+            'https://login.microsoftonline.com/b411bcba-01b1-4de5-9fa1-45272da91a0c/federationmetadata/2007-06/federationmetadata.xml?appid=db0e60a2-0f7b-4a61-939a-56fbae2d8b8c' \
+            -o /work/entra.xml
+
+      - name: Validate embedded standard Entra metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /work/check.php <<'PHP'
+          <?php
+          declare(strict_types=1);
+
+          $raw = file_get_contents('/work/entra.xml');
+          if (!is_string($raw)) {
+              throw new RuntimeException('metadata read failed');
+          }
+          $raw = preg_replace('/^\xEF\xBB\xBF/', '', $raw) ?? $raw;
+          $raw = preg_replace('/^\s*<\?xml[^?]*\?>\s*/', '', $raw, 1) ?? $raw;
+
+          $now = gmdate('Y-m-d\\TH:i:s\\Z');
+          $xml = '<?xml version="1.0" encoding="UTF-8"?>'
+            . '<p:Response xmlns:p="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:a="urn:oasis:names:tc:SAML:2.0:assertion"'
+            . ' ID="_response" Version="2.0" IssueInstant="'.$now.'">'
+            . '<a:Issuer>https://sts.windows.net/b411bcba-01b1-4de5-9fa1-45272da91a0c/</a:Issuer>'
+            . '<p:Status><p:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/>'
+            . '<p:StatusDetail>'.$raw.'</p:StatusDetail></p:Status>'
+            . '<a:Assertion ID="_assertion" Version="2.0" IssueInstant="'.$now.'">'
+            . '<a:Issuer>https://sts.windows.net/b411bcba-01b1-4de5-9fa1-45272da91a0c/</a:Issuer>'
+            . '<a:Subject><a:NameID>test@example.invalid</a:NameID></a:Subject>'
+            . '<a:Conditions/>'
+            . '<a:AuthnStatement AuthnInstant="'.$now.'"><a:AuthnContext><a:AuthnContextClassRef>'
+            . 'urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport'
+            . '</a:AuthnContextClassRef></a:AuthnContext></a:AuthnStatement>'
+            . '</a:Assertion></p:Response>';
+
+          $doc = new DOMDocument();
+          $doc->preserveWhiteSpace = true;
+          if (!$doc->loadXML($xml, LIBXML_NONET)) {
+              throw new RuntimeException('outer XML parse failed');
+          }
+          libxml_use_internal_errors(true);
+          libxml_clear_errors();
+          $schema = '/work/php-saml-4.3.2/src/Saml2/schemas/saml-schema-protocol-2.0.xsd';
+          $ok = @$doc->schemaValidate($schema);
+          $errors = [];
+          foreach (libxml_get_errors() as $error) {
+              $errors[] = [
+                  'level' => $error->level,
+                  'code' => $error->code,
+                  'line' => $error->line,
+                  'message' => trim($error->message),
+              ];
+          }
+          $out = [
+              'php' => PHP_VERSION,
+              'libxml' => defined('LIBXML_DOTTED_VERSION') ? LIBXML_DOTTED_VERSION : null,
+              'schema_valid' => $ok,
+              'errors' => $errors,
+          ];
+          file_put_contents('/work/evidence/result.json', json_encode($out, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)."\n");
+          echo json_encode($out, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), "\n";
+          PHP
+          php /work/check.php
+          cp /work/entra.xml /work/evidence/entra.xml
+          php -v > /work/evidence/php-version.txt
+          php -i | grep -E '^(libXML|DOM/XML|PHP Version)' > /work/evidence/runtime.txt || true
+          sha256sum /work/evidence/* > /work/evidence/SHA256SUMS
+
+      - name: Upload matrix evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: entra-schema-${{ matrix.label }}
+          path: /work/evidence/
+          if-no-files-found: error
+          retention-days: 1
